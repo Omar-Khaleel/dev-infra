@@ -1,0 +1,8 @@
+1) github-actions/previews/upload-artifacts-to-firebase/action.yml
+2) workflow_run
+3) privileged side effect: Deploy to Firebase preview channel and post a sticky PR comment using a privileged GitHub token.
+4) Unpacked artifact contents (`__metadata__pull_number.txt` and `__metadata__build_revision.txt`)
+5) `channelId` parameter in `FirebaseExtended/action-hosting-deploy` and `number` parameter in `marocchino/sticky-pull-request-comment`
+6) Yes, artifact metadata is trusted directly from the unpacked ZIP archive and not validated or bound to the originating workflow_run or PR.
+7) Yes, a confused-deputy / cross-PR mixup is possible. An attacker can create a PR that builds an artifact containing arbitrary `pull-number` metadata. The privileged workflow will deploy to that PR's preview channel and post a comment on that PR (or any issue).
+8) reportable
