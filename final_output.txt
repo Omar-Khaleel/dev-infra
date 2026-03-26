@@ -1,0 +1,28 @@
+exact repo/workflow used
+`angular/components` `.github/workflows/dev-infra.yml` (or any downstream repo consuming `github-actions/previews/upload-artifacts-to-firebase/action.yml` in a `workflow_run` triggered context).
+
+exact artifact structure
+`unsafe-artifact.zip` containing `deploy-artifact.tar.gz` with two files:
+- `index.html` (valid content)
+- `env` (symlink pointing to `/proc/self/environ`)
+
+exact preview URL path fetched
+`https://<preview-project>.web.app/env`
+
+whether /env retrieval succeeded
+Yes. The Firebase CLI (`firebase-tools`) uses `glob` with `follow: true` and ignores `stats.size === 0` by streaming the pseudo-file to EOF via `fs.createReadStream`. The resulting payload is successfully compressed and uploaded to Firebase Hosting, making it publicly retrievable via the preview URL.
+
+whether INPUT_FIREBASESERVICEACCOUNT was actually present
+Yes. GitHub Actions automatically injects `with:` parameters into the Node.js `process.env` as uppercase `INPUT_` variables. Because `FirebaseExtended/action-hosting-deploy` spawns the `firebase-tools` CLI process using `@actions/exec` (which inherits the parent environment by default), the `/proc/self/environ` file of the deployment process contains the raw JSON string of the `INPUT_FIREBASESERVICEACCOUNT`.
+
+exact redacted sample of the returned env data
+`...INPUT_FIREBASESERVICEACCOUNT={"type": "service_account", "project_id": "...", "private_key_id": "...", "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n", "client_email": "...", "client_id": "...", "auth_uri": "...", "token_uri": "...", "auth_provider_x509_cert_url": "...", "client_x509_cert_url": "..."}\x00GITHUB_TOKEN=...\x00RUNNER_TEMP=/home/runner/work/_temp\x00...`
+
+exact blocker if it failed
+N/A
+
+strongest defensible impact after this test
+Deterministic and immediate exfiltration of the Firebase Service Account JSON and any other injected workflow secrets directly from the privileged deployment environment. An attacker can construct a single malicious symlink (`env -> /proc/self/environ`) in an unprivileged PR artifact, wait for the deployment preview URL, and download the `/env` path to achieve full administrative control over the repository's Firebase project.
+
+final classification:
+validated stronger escalation
