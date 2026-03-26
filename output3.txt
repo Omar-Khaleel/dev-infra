@@ -1,0 +1,13 @@
+whether .git/config token theft is dead:
+Yes. Modern `actions/checkout` unsets the extraheader containing the `GITHUB_TOKEN` after the repository is checked out. The token is no longer present in `.git/config` when the Firebase deploy step runs.
+
+whether RUNNER_TEMP / os.tmpdir credential exposure is proven or still speculative:
+Still speculative. `action-hosting-deploy` creates the Google Application Credentials file using `tmp.fileSync()`, which appends a random 6-character suffix to the filename in `/tmp`. Because Firebase Hosting does not provide directory listing, retrieving this file requires an infeasible 56-billion-request web brute-force.
+
+strongest defensible impact wording:
+Deterministic out-of-tree file disclosure of the privileged runner’s filesystem. An attacker can construct an artifact containing a symlink to the repository workspace (`/home/runner/work/<repo>/<repo>`). When traversed by Firebase CLI, this exposes the privileged workflow's files—such as the downloaded `unsafe-artifact.zip` created outside the intended deployment directory—proving the attacker can arbitrarily read workflow-generated files.
+
+exact next PoC step:
+Submit a PR that builds an artifact containing a symlink `leak-workspace -> /home/runner/work/<repo>/<repo>` within `deploy-artifact.tar.gz`. Once the privileged `upload-artifacts-to-firebase` workflow deploys the preview, curl the preview URL (`https://<preview-url>/leak-workspace/unsafe-artifact.zip`) to demonstrate deterministic retrieval of the out-of-tree marker file created by the privileged action.
+
+final classification: reportable core

